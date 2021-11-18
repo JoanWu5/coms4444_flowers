@@ -59,10 +59,17 @@ class FlowerMarriageGame:
     def reset_game_state(self):
         # Instantiate suitors
         self.suitors = [suitor_by_name(self.suitor_names[i], self.d, self.p, i) for i in range(self.p)]
+        self.suitors = list(filter(None, self.suitors))
         suitor_conformity = list(map(validate_suitor, self.suitors))
+        valid_suitors = []
         for suitor, suitor_status in zip(self.suitors, suitor_conformity):
             if suitor_conformity == 0:
-                self.logger.error(f'Suitor {suitor.suitor_id} provided invalid zero/one boundary bouquets.')
+                self.logger.error(f'Suitor {suitor.suitor_id} '
+                                  f'({suitor.name}) provided invalid zero/one boundary bouquets.')
+            else:
+                valid_suitors.append(suitor)
+        self.suitors = valid_suitors
+        self.p = len(self.suitors)
 
         # Instantiate arrays to keep track of bouquets provided at each round, as well as scores and ranks.
         self.bouquets = np.empty(shape=(self.d, self.p, self.p), dtype=Bouquet)
@@ -181,7 +188,8 @@ class FlowerMarriageGame:
             if self._is_valid_offer_format(offer):
                 valid_offers.append(offer)
             else:
-                self.logger.error(f'Suitor {suitor.suitor_id} provided an invalid format for its offering: {offer}')
+                self.logger.error(f'Suitor {suitor.suitor_id} ({suitor.name}) '
+                                  f'provided an invalid format for its offering: {offer}')
                 is_invalid_format = True
                 break
             for flower, ct in offer[-1].arrangement.items():
@@ -189,15 +197,15 @@ class FlowerMarriageGame:
                 if flower not in flowers_for_round:
                     is_hallucinated = True
                     self.logger.error(
-                        f'Suitor {suitor.suitor_id} tried to offer a flower {flower} '
+                        f'Suitor {suitor.suitor_id} ({suitor.name}) tried to offer a flower {flower} '
                         f'which is unavailable at the market today. '
                     )
                     break
                 if offer_cts[flower] > flowers_for_round[flower]:
                     is_more_than_market = True
                     self.logger.error(
-                        f'Suitor {suitor.suitor_id} gave away atleast {offer_cts[flower]} {flower} flowers. '
-                        f'There are only {flowers_for_round[flower]} available at the market.')
+                        f'Suitor {suitor.suitor_id} ({suitor.name}) gave away atleast {offer_cts[flower]} '
+                        f'{flower} flowers. There are only {flowers_for_round[flower]} available at the market.')
                     break
             if is_more_than_market or is_hallucinated or is_invalid_format:
                 break
@@ -218,10 +226,16 @@ class FlowerMarriageGame:
             assert suitor_from != suitor_to
             bouquet = Bouquet({}) if bouquet is None else bouquet
             self.bouquets[curr_round, suitor_from, suitor_to] = bouquet
-            score = aggregate_score(self.suitors[suitor_to], bouquet)
+            try:
+                score = float(aggregate_score(self.suitors[suitor_to], bouquet))
+            except:
+                self.logger.error(f'Suitor {suitor_to} ({self.suitors[suitor_to].name})'
+                                  f' had a bug when scoring the bouquet.  Setting it to 0')
+                score = 0
             if score < 0 or score > 1:
                 self.logger.error(
-                    f'Suitor {suitor_to} provided an invalid score - i.e., not in [0, 1].  Setting it to 0')
+                    f'Suitor {suitor_to} ({self.suitors[suitor_to].name})'
+                    f' provided an invalid score - i.e., not in [0, 1].  Setting it to 0')
                 score = 0
             self.scores[curr_round, suitor_from, suitor_to] = score
         np.fill_diagonal(self.scores[curr_round], float('-inf'))
@@ -293,6 +307,8 @@ def aggregate_score(suitor: BaseSuitor, bouquet: Bouquet):
 
 
 def validate_suitor(suitor):
+    if suitor is None:
+        return 0
     try:
         assert aggregate_score(suitor, suitor.zero_score_bouquet()) == 0
         assert aggregate_score(suitor, suitor.one_score_bouquet()) == 1
