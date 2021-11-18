@@ -78,7 +78,7 @@ class Suitor(BaseSuitor):
         # test others hypothesis: whether they separately the types/sizes/colors,
         # we test the hypothesis for the next 3 days
         self.guess_other_threhold = 30
-        self.last_days_guess_others = self.days // 3
+        self.last_days_guess_others =  10
         self.guess_other_times = 2
         self.test_other_hypothesis_days = [self.guess_other_times] * num_suitors
         self.test_other_hypothesis = [0] * num_suitors
@@ -580,7 +580,7 @@ class Suitor(BaseSuitor):
                     else:
                         self.has_our_strat[recipient_id] = -1
 
-            if score > 0:
+            if score > 0.5:
                 if score == 1 and sum(flower_sent.values()) <= 2:
                     self.score_other_smallest_bouquet[recipient_id] = dict(flower_sent)
                     self.score_other_smallest_bouquet_score[recipient_id] = score
