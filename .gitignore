@@ -1,3 +1,7 @@
 .idea
 __pycache__
 *.log
+.vscode
+results
+tourney_configs.csv
+logs

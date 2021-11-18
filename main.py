@@ -1,5 +1,7 @@
+from collections import Counter, defaultdict
 import logging
 import itertools
+import os
 
 import argparse
 import numpy as np
@@ -12,28 +14,33 @@ from gui_app import FlowerApp
 from suitors.base import BaseSuitor
 from suitors.suitor_factory import suitor_by_name
 from utils import flatten_counter
+from time_utils import prepare_empty_bouquets
 
 
 class FlowerMarriageGame:
-    def __init__(self, args):
+    def __init__(self, args, suitor_names=None):
         self.d = args.d
+        self.random_state = args.random_state
         self.restrict_time = args.restrict_time
+        self.remove_round_logging = args.remove_round_logging
         logging.basicConfig(
-            format='%(asctime)s %(levelname)s:%(message)s', level=logging.DEBUG,
+            level=logging.DEBUG,
             handlers=[logging.FileHandler(args.log_file, mode='w'), logging.StreamHandler()]
         )
         self.logger = logging.getLogger(__name__)
         # A CSV config file specifying each group and their associated instances in the game.
         if args.p_from_config:
-            config_df = pd.read_csv('config.csv')
+            config_df = pd.read_csv(args.config_path)
             config_df = config_df[config_df['counts'] > 0]
             assert len(config_df) > 0
             self.suitor_names = flatten_counter(dict(zip(config_df['group'], config_df['counts'])))
             self.p = config_df.counts.sum()
         else:
             self.p = args.p
-            self.suitor_names = [args.group] * self.p
+            self.suitor_names = [args.group] * self.p if suitor_names is None else suitor_names
+            assert len(self.suitor_names) == self.p
         assert self.p >= 2 and self.p % 2 == 0
+        np.random.seed(self.random_state)
 
         self.gui = args.gui
         self.possible_flowers = get_all_possible_flowers()
@@ -52,15 +59,27 @@ class FlowerMarriageGame:
     def reset_game_state(self):
         # Instantiate suitors
         self.suitors = [suitor_by_name(self.suitor_names[i], self.d, self.p, i) for i in range(self.p)]
+        self.suitors = list(filter(None, self.suitors))
         suitor_conformity = list(map(validate_suitor, self.suitors))
+        valid_suitors = []
         for suitor, suitor_status in zip(self.suitors, suitor_conformity):
             if suitor_conformity == 0:
-                self.logger.error(f'Suitor {suitor.suitor_id} provided invalid zero/one boundary bouquets.')
+                self.logger.error(f'Suitor {suitor.suitor_id} '
+                                  f'({suitor.name}) provided invalid zero/one boundary bouquets.')
+            else:
+                valid_suitors.append(suitor)
+        self.suitors = valid_suitors
+        self.p = len(self.suitors)
 
         # Instantiate arrays to keep track of bouquets provided at each round, as well as scores and ranks.
         self.bouquets = np.empty(shape=(self.d, self.p, self.p), dtype=Bouquet)
+        for d in range(self.d):
+            for row in range(self.p):
+                for col in range(self.p):
+                    self.bouquets[d, row, col] = Bouquet({})
         self.scores = np.zeros(shape=(self.d, self.p, self.p), dtype=float)
         self.ranks = np.zeros(shape=(self.d, self.p, self.p), dtype=int)
+        self.ties = np.zeros(shape=(self.d, self.p, self.p), dtype=int)
         self.next_round = 0
         self.marriages = None
         self.advantage = None
@@ -71,14 +90,65 @@ class FlowerMarriageGame:
         self.next_round = self.d
         return self.marry_folks()
 
+    def generate_output_df(self):
+        output = []
+        # self.marriages
+        for i in range(self.p):
+            suitor = self.suitors[i]
+            suitor_id = suitor.suitor_id
+            suitor_name = suitor.name
+            uid = f'{suitor_name}_{suitor_id}'
+
+            my_union_idx = -1
+            union_status = ''
+            partner_suitor_id = -1
+            for union_idx, union in enumerate(self.marriages['unions']):
+                if i == union['suitor']:
+                    my_union_idx = union_idx
+                    partner_suitor_id = union['chooser']
+                    union_status = 'suitor'
+                    break
+                elif i == union['chooser']:
+                    my_union_idx = union_idx
+                    partner_suitor_id = union['suitor']
+                    union_status = 'chooser'
+                    break
+            assert my_union_idx > -1
+            row = {
+                'suitor_id': suitor_id,
+                'name': suitor_name,
+                'random_state': self.random_state,
+                'p': self.p,
+                'd': self.d,
+                'uid': uid,
+                'marriage_score': self.marriages['scores'][i],
+                'union_status': union_status,
+                'partner_suitor_id': partner_suitor_id,
+                'partner_name': self.suitors[partner_suitor_id].name,
+                'union_priority': my_union_idx,
+            }
+
+            for d in range(self.d):
+                row[f'day_{d}_bouquet_offers'] = '<sep>'.join([str(x) for x in self.bouquets[d, i, :]])
+                row[f'day_{d}_bouquet_received'] = '<sep>'.join([str(x) for x in self.bouquets[d, :, i]])
+                row[f'day_{d}_score_offers'] = '<sep>'.join([str(x) for x in self.scores[d, i, :]])
+                row[f'day_{d}_score_received'] = '<sep>'.join([str(x) for x in self.scores[d, :, i]])
+
+            output.append(row)
+        return pd.DataFrame(output)
+
     def is_over(self):
         return self.next_round == self.d
 
     def set_app(self, flower_app):
         self.flower_app = flower_app
 
-    def resolve_prepare_func(self, suitor):
-        return suitor.prepare_bouquets_timed if self.restrict_time else suitor.prepare_bouquets
+    def resolve_prepare_func(self, suitor, is_final_round=False):
+        if not self.restrict_time:
+            return suitor.prepare_bouquets
+        if is_final_round:
+            return suitor.prepare_bouquets_timed_final_round
+        return suitor.prepare_bouquets_timed
 
     def resolve_feedback_func(self, suitor):
         return suitor.receive_feedback_timed if self.restrict_time else suitor.receive_feedback
@@ -92,30 +162,97 @@ class FlowerMarriageGame:
                     self.ranks[curr_round, i, j], self.scores[curr_round, i, j], self.bouquets[curr_round, i, j])
                 giver = f'{self.suitors[i].name}_{self.suitors[i].suitor_id}'
                 receiver = f'{self.suitors[j].name}_{self.suitors[j].suitor_id}'
-                str = f'{giver} bouquet to {receiver} scored {round(score, 3)} (rank={rank}) -> {bouquet}'
+                str = f'Round {curr_round}: ' \
+                      f'{giver} bouquet to {receiver} scored {round(score, 3)} (rank={rank}) -> {bouquet}'
                 self.logger.info(str)
 
+    def _is_valid_offer_format(self, offer):
+        if not hasattr(offer, '__iter__'):
+            return False
+        if len(offer) != 3:
+            return False
+        if type(offer[2]) != Bouquet:
+            return False
+        try:
+            return min(offer[:2]) > -1 and max(offer[:2]) < self.p
+        except:
+            return False
+
+    def fix_offers(self, suitor, offers, flowers_for_round):
+        offer_cts = defaultdict(int)
+        is_more_than_market = False
+        is_hallucinated = False
+        is_invalid_format = False
+        valid_offers = []
+        for offer in offers:
+            if self._is_valid_offer_format(offer):
+                valid_offers.append(offer)
+            else:
+                self.logger.error(f'Suitor {suitor.suitor_id} ({suitor.name}) '
+                                  f'provided an invalid format for its offering: {offer}')
+                is_invalid_format = True
+                break
+            for flower, ct in offer[-1].arrangement.items():
+                offer_cts[flower] += ct
+                if flower not in flowers_for_round:
+                    is_hallucinated = True
+                    self.logger.error(
+                        f'Suitor {suitor.suitor_id} ({suitor.name}) tried to offer a flower {flower} '
+                        f'which is unavailable at the market today. '
+                    )
+                    break
+                if offer_cts[flower] > flowers_for_round[flower]:
+                    is_more_than_market = True
+                    self.logger.error(
+                        f'Suitor {suitor.suitor_id} ({suitor.name}) gave away atleast {offer_cts[flower]} '
+                        f'{flower} flowers. There are only {flowers_for_round[flower]} available at the market.')
+                    break
+            if is_more_than_market or is_hallucinated or is_invalid_format:
+                break
+
+        if is_more_than_market or is_hallucinated or is_invalid_format:
+            return prepare_empty_bouquets(suitor)
+        return valid_offers
+
     def simulate_round(self, curr_round):
+        is_final_round = curr_round == self.d - 1
         suitor_ids = [suitor.suitor_id for suitor in self.suitors]
         flowers_for_round = sample_n_random_flowers(self.possible_flowers, self.num_flowers_to_sample)
-        offers = list(itertools.chain(
-            *map(lambda suitor: self.resolve_prepare_func(suitor)(flowers_for_round), self.suitors)))
-        for (suitor_from, suitor_to, bouquet) in offers:
+        offers = list(map(lambda suitor: self.resolve_prepare_func(suitor, is_final_round=is_final_round)(
+            flowers_for_round.copy()), self.suitors))
+        offers = list(map(lambda i: self.fix_offers(self.suitors[i], offers[i], flowers_for_round), range(self.p)))
+        offers_flat = list(itertools.chain(*offers))
+        for (suitor_from, suitor_to, bouquet) in offers_flat:
             assert suitor_from != suitor_to
+            bouquet = Bouquet({}) if bouquet is None else bouquet
             self.bouquets[curr_round, suitor_from, suitor_to] = bouquet
-            score = aggregate_score(self.suitors[suitor_to], bouquet)
+            try:
+                score = float(aggregate_score(self.suitors[suitor_to], bouquet))
+            except:
+                self.logger.error(f'Suitor {suitor_to} ({self.suitors[suitor_to].name})'
+                                  f' had a bug when scoring the bouquet.  Setting it to 0')
+                score = 0
             if score < 0 or score > 1:
                 self.logger.error(
-                    f'Suitor {suitor_to} provided an invalid score - i.e., not in [0, 1].  Setting it to 0')
+                    f'Suitor {suitor_to} ({self.suitors[suitor_to].name})'
+                    f' provided an invalid score - i.e., not in [0, 1].  Setting it to 0')
                 score = 0
             self.scores[curr_round, suitor_from, suitor_to] = score
         np.fill_diagonal(self.scores[curr_round], float('-inf'))
         round_ranks = rankdata(-self.scores[curr_round], axis=0, method='min')
         self.ranks[curr_round, :, :] = round_ranks
-        list(map(lambda i: self.resolve_feedback_func(self.suitors[i])(
-            tuple(zip(self.ranks[curr_round, i, :], self.scores[curr_round, i, :]))), suitor_ids))
+        col_rank_cts = list(map(lambda col: Counter(round_ranks[:, col]), range(self.p)))
+        for row in range(self.p):
+            for col in range(self.p):
+                rank = round_ranks[row, col]
+                self.ties[curr_round, row, col] = col_rank_cts[col][rank]
 
-        self.log_round(curr_round)
+        list(map(lambda i: self.resolve_feedback_func(self.suitors[i])(
+            tuple(zip(self.ranks[curr_round, i, :], self.scores[curr_round, i, :], self.ties[curr_round, i, :]))
+        ), suitor_ids))
+
+        if not self.remove_round_logging:
+            self.log_round(curr_round)
 
     def simulate_next_round(self):
         if self.next_round < self.d:
@@ -130,7 +267,7 @@ class FlowerMarriageGame:
     def marry_folks(self):
         final_scores = self.scores[-1, :, :]
         married = np.full((self.p,), False)
-        second_best_scores = np.array([np.sort(list(set(final_scores[:, i])))[-2] for i in range(self.p)])
+        second_best_scores = np.clip(np.array([np.sort(final_scores[:, i])[-2] for i in range(self.p)]), 0, 1)
         self.advantage = final_scores - second_best_scores
         priority = np.copy(self.advantage)
 
@@ -166,11 +303,12 @@ def aggregate_score(suitor: BaseSuitor, bouquet: Bouquet):
     size_score = suitor.score_sizes(bouquet.sizes)
     type_score = suitor.score_types(bouquet.types)
     agg_score = color_score + size_score + type_score
-    assert 0 <= agg_score <= 1
     return agg_score
 
 
 def validate_suitor(suitor):
+    if suitor is None:
+        return 0
     try:
         assert aggregate_score(suitor, suitor.zero_score_bouquet()) == 0
         assert aggregate_score(suitor, suitor.one_score_bouquet()) == 1
@@ -189,14 +327,20 @@ if __name__ == '__main__':
     parser.add_argument(
         '--group', type=str, default='Group name will be duplicated p times. Ignored if p_from_config=True.')
     parser.add_argument('-p_from_config', default=False, action='store_true')
+    parser.add_argument('--config_path', default='config.csv', help='path from which to read in the config file.')
     parser.add_argument('--random_state', type=int, default=1992, help='Random seed.  Fix for consistent experiments')
     parser.add_argument('--port', '-p', type=int, default=8080, help='Port to start')
     parser.add_argument('--address', type=str, default='127.0.0.1', help='Address')
     parser.add_argument('-no_browser', default=False, action='store_true', help='Disable browser launching in GUI mode')
     parser.add_argument('-gui', default=False, action='store_true', help='Enable GUI')
+    parser.add_argument('-remove_round_logging', default=False, action='store_true')
+    parser.add_argument('--run_id', default='default', help='Specify filename under ./results to save results.')
+    parser.add_argument('-save_results', default=False, action='store_true')
 
     args = parser.parse_args()
-
-    np.random.seed(args.random_state)
     game = FlowerMarriageGame(args)
     game.play()
+    if args.save_results:
+        output_df = game.generate_output_df()
+        out_fn = os.path.join('results', f'{args.run_id}.csv')
+        output_df.to_csv(out_fn, index=False)
